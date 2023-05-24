@@ -1,0 +1,146 @@
+# Predicting Model
+import sklearn
+from google.cloud import storage, firestore
+import tempfile
+import pickle
+import json
+
+storage_client = storage.Client()
+firestore_client = firestore.Client()
+
+def predict_sentiment(event, context):
+    # load pipeline file (download from bucket)
+    bucket = storage_client.bucket('gkusiatin-ballbucket')
+    blob = bucket.blob('reddit_sentiment_model.pkl')
+    pipeline_file = tempfile.gettempdir() + '/pipeline.pkl'
+    blob.download_to_filename(pipeline_file)
+    pipeline = pickle.load(open(pipeline_file, 'rb'))
+    # load movie reviews json file from bucket
+    bucket = storage_client.bucket('gkusiatin-ballposts')
+    blob = bucket.blob('NBA.json')
+    data_file = tempfile.gettempdir() + '/NBA.json'
+    blob.download_to_filename(data_file)
+    posts = json.load(open(data_file))
+    # predict sentiment of reddit posts
+    docs = []
+    for post in posts:
+        body = post.get('Body', '')
+        title = post.get('Title', '')
+        text = body + title
+        docs.append(text)
+    predictions = pipeline.predict(docs)
+    # add the reddit posts and sentiment predictions to firestore database
+    i = 0
+    coll = firestore_client.collection('reddit_NBA')
+    for post in posts:
+        post['sentiment'] = predictions[i]
+        doc_ref = coll.document(post['id'])
+        doc = doc_ref.get()
+        if doc.exists:
+            doc_ref.update(post)
+        else:
+            doc_ref.set(post)  
+        i += 1
+    print('number of records inserted or updated', i)
+
+#Training model
+import tempfile
+import pickle
+import pandas as pd
+from google.cloud import storage
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, f1_score
+
+storage_client = storage.Client()
+
+def train_model(request):
+    # load the training data file from bucket
+    bucket = storage_client.bucket('gkusiatin-ballbucket')
+    blob = bucket.blob('combined_sentiment.csv')
+    data_file = tempfile.gettempdir() + '/ballbucket.csv'
+    blob.download_to_filename(data_file)
+    
+    # Load preprocessed data
+    df = pd.read_csv(data_file)
+    
+    # Split the data into training and test sets
+    X_train, X_test, y_train, y_test = train_test_split(df['text'], df['sentiment'], test_size=0.2, random_state=42)
+    
+    # Build the model pipeline
+    pipeline = Pipeline([
+        ('vectorizer', CountVectorizer(stop_words='english')),
+        ('classifier', LogisticRegression())
+    ])
+    
+    # Fit the model
+    pipeline.fit(X_train, y_train)
+    
+    # Predict on test set and evaluate the model performance
+    y_pred = pipeline.predict(X_test)
+    test_acc = accuracy_score(y_test, y_pred)
+    test_f1 = f1_score(y_test, y_pred, pos_label='positive')
+    
+    # Save the model
+    pipeline_file = tempfile.gettempdir() + '/model.pkl'
+    with open(pipeline_file, 'wb') as f:
+        pickle.dump(pipeline, f)
+    
+    # Upload the model to GCS
+    bucket = storage_client.bucket("gkusiatin-ballbucket")
+    blob = bucket.blob('reddit_sentiment_model.pkl')
+    blob.upload_from_filename(pipeline_file)
+    
+    resp = {}
+    resp['training_accuracy'] = test_acc
+    resp['validation_accuracy'] = test_f1
+    
+    return resp
+
+
+#Retrival function
+from google.cloud import storage
+import json
+import requests
+import tempfile
+
+storage_client = storage.Client()
+REDDIT_CREDENTIALS_FILE = 'reddit_stuff.json'
+
+
+# This function gets the access token for Reddit API calls
+# It uses the Reddit Credentials file to authenticate
+def get_reddit_posts(req):
+    rc = json.load(open(REDDIT_CREDENTIALS_FILE))
+    auth = requests.auth.HTTPBasicAuth(rc['client_id'], rc['secret_token'])
+    data = {
+        'grant_type': 'password',
+        'username': rc['username'],
+        'password': rc['password']
+    }
+    headers = {'User-Agent': 'scraper/0.0.1'}
+    resp = requests.post(
+        'https://www.reddit.com/api/v1/access_token',
+        auth=auth,
+        data=data,
+        headers=headers)
+    TOKEN = resp.json()['access_token']
+    headers = {'User-Agent': 'scraper/0.0.1'}
+    headers = {**headers, **{'Authorization': f"bearer {TOKEN}"}}
+    url = "https://oauth.reddit.com/" + "r/NBA" + "/new"
+    resp = requests.get(url, headers=headers)
+    posts = [p['data'] for p in resp.json()['data']['children']]
+    # Writing the downloaded data to json file
+    data_file = tempfile.gettempdir() + '/NBA.json'
+    with open(data_file, 'w', encoding='utf-8') as f:
+        json.dump(posts, f, ensure_ascii=False, indent=4)
+    print('got', len(posts), 'posts from subreddit')
+
+#storing in bucket
+    bucket = storage_client.bucket("gkusiatin-ballposts")
+    blob = bucket.blob("NBA.json")
+    blob.upload_from_filename(data_file)
+    
+    return ''
